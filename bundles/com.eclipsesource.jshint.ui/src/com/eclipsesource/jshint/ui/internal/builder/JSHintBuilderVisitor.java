@@ -18,6 +18,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.UnsupportedEncodingException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
@@ -44,16 +51,43 @@ import com.eclipsesource.jshint.ui.internal.preferences.ResourceSelector;
 
 class JSHintBuilderVisitor implements IResourceVisitor, IResourceDeltaVisitor {
 
-  private final JSHint checker;
   private final ResourceSelector selector;
   private final IProgressMonitor monitor;
 
+  private final IProject project;
+  private final List<Future<?>> futures = new ArrayList<Future<?>>();
+  private final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+
   public JSHintBuilderVisitor( IProject project, IProgressMonitor monitor ) throws CoreException {
+    this.project = project;
     Preferences node = PreferencesFactory.getProjectPreferences( project );
     new EnablementPreferences( node );
     selector = new ResourceSelector( project );
-    checker = selector.allowVisitProject() ? createJSHint( project ) : null;
     this.monitor = monitor;
+  }
+
+  void close() throws CoreException {
+    service.shutdown();
+    try {
+      service.awaitTermination(1, TimeUnit.DAYS);
+    } catch (InterruptedException e1) {
+      throw new RuntimeException(e1);
+    }
+    for (Future<?> f : futures) {
+      try {
+        f.get();
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      } catch (ExecutionException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof CoreExceptionWrapper) {
+          throw (CoreException)((CoreExceptionWrapper) cause).getCause();
+        } else if (cause instanceof RuntimeException) {
+          throw (RuntimeException) cause;
+        }
+        throw new RuntimeException(e);
+      }
+    }
   }
 
   public boolean visit( IResourceDelta delta ) throws CoreException {
@@ -77,7 +111,7 @@ class JSHintBuilderVisitor implements IResourceVisitor, IResourceDeltaVisitor {
     return descend;
   }
 
-  private JSHint createJSHint( IProject project ) throws CoreException {
+  private static JSHint createJSHint( IProject project ) throws CoreException {
     JSHint jshint = new JSHint();
     try {
       InputStream inputStream = getCustomLib();
@@ -98,17 +132,43 @@ class JSHintBuilderVisitor implements IResourceVisitor, IResourceDeltaVisitor {
     return jshint;
   }
 
-  private void check( IFile file ) throws CoreException {
-    Text code = readContent( file );
-    ProblemHandler handler = new MarkerHandler( new MarkerAdapter( file ), code );
-    try {
-      checker.check( code, handler );
-    } catch( CoreExceptionWrapper wrapper ) {
-      throw (CoreException)wrapper.getCause();
-    } catch( RuntimeException exception ) {
-      String message = "Failed checking file " + file.getFullPath().toPortableString();
-      throw new RuntimeException( message, exception );
+  private ThreadLocal<JSHint> CHECKER_THREADLOCAL = new ThreadLocal<JSHint>() {
+    @Override
+    protected JSHint initialValue() {
+      try {
+        return selector.allowVisitProject() ? createJSHint(project) : null;
+      } catch (CoreException e) {
+        throw new CoreExceptionWrapper(e);
+      }
     }
+  };
+
+  private void check(final IFile file)
+  {
+    Future<?> future = service.submit(new Runnable() {
+      public void run() {
+        if (monitor.isCanceled()) {
+          return;
+        }
+        Text code;
+        try {
+          code = readContent( file );
+        } catch (CoreException e) {
+          throw new CoreExceptionWrapper(e);
+        }
+        JSHint checker = CHECKER_THREADLOCAL.get();
+        if (checker != null) {
+          ProblemHandler handler = new MarkerHandler( new MarkerAdapter(file), code );
+          try {
+            checker.check( code, handler );
+          } catch (RuntimeException exception) {
+            String message = "Failed checking file " + file.getFullPath().toPortableString();
+            throw new RuntimeException( message, exception );
+          }
+        }
+      }
+    });
+    futures.add(future);
   }
 
   private static void clean( IResource resource ) throws CoreException {
