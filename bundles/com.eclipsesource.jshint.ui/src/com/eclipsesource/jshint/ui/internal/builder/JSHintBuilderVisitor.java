@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
@@ -57,6 +58,9 @@ class JSHintBuilderVisitor implements IResourceVisitor, IResourceDeltaVisitor {
   private final IProject project;
   private final List<Future<?>> futures = new ArrayList<Future<?>>();
   private final ExecutorService service = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+
+  private final AtomicInteger tasksStarted = new AtomicInteger();
+  private final AtomicInteger tasksCompleted = new AtomicInteger();
 
   public JSHintBuilderVisitor( IProject project, IProgressMonitor monitor ) throws CoreException {
     this.project = project;
@@ -145,11 +149,13 @@ class JSHintBuilderVisitor implements IResourceVisitor, IResourceDeltaVisitor {
 
   private void check(final IFile file)
   {
+    tasksStarted.incrementAndGet();
     Future<?> future = service.submit(new Runnable() {
       public void run() {
         if (monitor.isCanceled()) {
           return;
         }
+        monitor.setTaskName("JSHint checking file " + tasksCompleted.get() + " of " + tasksStarted.get());
         Text code;
         try {
           code = readContent( file );
@@ -166,6 +172,7 @@ class JSHintBuilderVisitor implements IResourceVisitor, IResourceDeltaVisitor {
             throw new RuntimeException( message, exception );
           }
         }
+        tasksCompleted.incrementAndGet();
       }
     });
     futures.add(future);
